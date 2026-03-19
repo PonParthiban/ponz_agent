@@ -8,14 +8,21 @@ from tools import TOOLS
 
 def generate_diff(old_content: str, new_content: str, filepath: str) -> str:
     """Generate unified diff between old and new content."""
+    # Normalize line endings and split
     old_lines = old_content.splitlines(keepends=True)
     new_lines = new_content.splitlines(keepends=True)
     
+    # Ensure final newline for proper diff
+    if old_lines and not old_lines[-1].endswith('\n'):
+        old_lines[-1] += '\n'
+    if new_lines and not new_lines[-1].endswith('\n'):
+        new_lines[-1] += '\n'
+    
     diff = difflib.unified_diff(
-        old_lines, new_lines,
+        old_lines,
+        new_lines,
         fromfile=f"a/{filepath}",
         tofile=f"b/{filepath}",
-        lineterm=""
     )
     return "".join(diff)
 
@@ -326,12 +333,16 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: b
                 )
                 continue
 
-            return {
+            result = {
                 "success": True,
                 "output": parsed.get("output", ""),
                 "history": history,
                 "modified": False
             }
+            if pending_diffs:
+                result["diffs"] = pending_diffs
+                result["applied"] = apply
+            return result
 
         # 🔥 FORCE FIX MODE - block all actions except write_file when syntax invalid
         if last_syntax_valid is False and action != "write_file":
@@ -344,7 +355,15 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: b
         if action == "write_file":
             filepath = inputs.get("path", "")
             new_content = inputs.get("content", "")
+            
+            # Try to find old content (handle both relative and absolute paths)
             old_content = file_contents.get(filepath, "")
+            if not old_content:
+                # Try to find by basename match
+                for stored_path, content in file_contents.items():
+                    if stored_path.endswith(filepath) or filepath.endswith(stored_path):
+                        old_content = content
+                        break
             
             # Generate diff
             diff = generate_diff(old_content, new_content, filepath)
@@ -405,9 +424,11 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: b
         if action == "read_file":
             filepath = inputs.get("path", "")
             content = result.get("content", "")
+            actual_path = result.get("path", filepath)  # Use resolved path from tool
             
-            # Store original content for diff
+            # Store original content for diff (both input path and resolved path)
             file_contents[filepath] = content
+            file_contents[actual_path] = content
             
             # Track processed files for multi-file tasks
             if filepath not in processed_files:
