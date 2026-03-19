@@ -385,6 +385,7 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve:
                     "success": True,
                     "status": "pending_approval",
                     "file": filepath,
+                    "new_content": new_content,  # Store for later apply
                     "diff": diff,
                     "syntax_valid": syntax_valid,
                     "syntax_message": syntax_message if not syntax_valid else None,
