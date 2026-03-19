@@ -4,6 +4,46 @@ import re
 from llm import chat
 from tools import TOOLS
 
+
+def extract_filename_from_task(task: str) -> str | None:
+    """Extract filename mentioned in task."""
+    # Match patterns like "test.py", "main.py", "/path/to/file.py"
+    match = re.search(r'[\w/\\.-]+\.py\b', task, re.IGNORECASE)
+    if match:
+        return match.group(0)
+    return None
+
+
+def is_multi_file_task(task: str) -> bool:
+    """Check if task requires processing multiple files."""
+    keywords = ["all files", "all python", "every file", "the project", "entire project", "whole project"]
+    return any(kw in task.lower() for kw in keywords)
+
+
+def match_file(filename: str, files: list[str]) -> str | None:
+    """Find best matching file from list."""
+    filename_lower = filename.lower()
+    base_name = filename_lower.split("/")[-1].split("\\")[-1]
+    
+    # Exact match
+    for f in files:
+        if f.lower() == filename_lower or f.lower().endswith("/" + filename_lower):
+            return f
+    
+    # Basename match
+    for f in files:
+        f_base = f.lower().split("/")[-1].split("\\")[-1]
+        if f_base == base_name:
+            return f
+    
+    # Partial match (filename without extension)
+    stem = base_name.replace(".py", "")
+    for f in files:
+        if stem in f.lower():
+            return f
+    
+    return None
+
 SYSTEM_PROMPT = """You are a coding assistant agent. You MUST respond with valid JSON only.
 
 Available tools:
@@ -209,7 +249,20 @@ def execute_tool(action: str, inputs: dict) -> dict:
 
 
 def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
-    messages = [f"{SYSTEM_PROMPT}\n\nTask: {task}"]
+    # File selection context
+    mentioned_file = extract_filename_from_task(task)
+    multi_file = is_multi_file_task(task)
+    files_to_process = []
+    processed_files = []
+    
+    # Build initial context with file hints
+    file_hint = ""
+    if mentioned_file:
+        file_hint = f"\n\nHINT: Task mentions file '{mentioned_file}' - prioritize this file."
+    elif multi_file:
+        file_hint = "\n\nHINT: This is a multi-file task. Use list_files first, then process each relevant file."
+    
+    messages = [f"{SYSTEM_PROMPT}\n\nTask: {task}{file_hint}"]
     history = []
     last_syntax_valid = True  # Track syntax state across iterations
 
@@ -271,11 +324,31 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
             messages.append(f"Tool error: {result.get('error')}")
             continue
 
+        # 🔥 FILE SELECTION ENHANCEMENT
+        file_selection_hint = ""
+        if action == "list_files":
+            files = result.get("files", [])
+            if files:
+                # Store for multi-file processing
+                if multi_file:
+                    files_to_process = [f for f in files if f.endswith(".py")]
+                    file_selection_hint = f"\nMulti-file task: process these files one by one: {files_to_process}"
+                elif mentioned_file:
+                    # Find best match
+                    best = match_file(mentioned_file, files)
+                    if best:
+                        file_selection_hint = f"\nBest match for '{mentioned_file}': {best} - use this file."
+                    else:
+                        file_selection_hint = f"\nNo exact match for '{mentioned_file}'. Available: {files}"
+
         # 🔥 AUTO SYNTAX CHECK
         syntax_info = ""
 
         if action == "read_file":
             filepath = inputs.get("path", "")
+            # Track processed files for multi-file tasks
+            if filepath not in processed_files:
+                processed_files.append(filepath)
             if filepath.endswith(".py"):
                 content = result.get("content", "")
                 syntax = TOOLS["check_syntax"]["function"](content)
@@ -308,7 +381,7 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
                 last_syntax_valid = True
 
         messages.append(
-            f"{response}\n\nRESULT:\n{json.dumps(result)}{syntax_info}"
+            f"{response}\n\nRESULT:\n{json.dumps(result)}{syntax_info}{file_selection_hint}"
         )
 
     return {
