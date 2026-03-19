@@ -1,8 +1,23 @@
 """Agent module - core agent logic with structured JSON tool calling"""
 import json
 import re
+import difflib
 from llm import chat
 from tools import TOOLS
+
+
+def generate_diff(old_content: str, new_content: str, filepath: str) -> str:
+    """Generate unified diff between old and new content."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{filepath}",
+        tofile=f"b/{filepath}",
+        lineterm=""
+    )
+    return "".join(diff)
 
 
 def extract_filename_from_task(task: str) -> str | None:
@@ -248,12 +263,16 @@ def execute_tool(action: str, inputs: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
+def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: bool = False) -> dict:
     # File selection context
     mentioned_file = extract_filename_from_task(task)
     multi_file = is_multi_file_task(task)
     files_to_process = []
     processed_files = []
+    
+    # Track original file contents for diff
+    file_contents = {}  # {filepath: original_content}
+    pending_diffs = []  # Store diffs to show
     
     # Build initial context with file hints
     file_hint = ""
@@ -289,11 +308,15 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
                     "Error: Code has syntax errors. You cannot finish. You MUST fix it using write_file."
                 )
                 continue
-            return {
+            result = {
                 "success": True,
                 "output": parsed.get("output", ""),
                 "history": history
             }
+            if pending_diffs:
+                result["diffs"] = pending_diffs
+                result["applied"] = apply
+            return result
 
         # 🔥 NO CHANGE (ENFORCED)
         if action == "no_change":
@@ -317,7 +340,42 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
             )
             continue
 
-        # 🔧 EXECUTE TOOL
+        # 🔥 DIFF PREVIEW FOR WRITE_FILE
+        if action == "write_file":
+            filepath = inputs.get("path", "")
+            new_content = inputs.get("content", "")
+            old_content = file_contents.get(filepath, "")
+            
+            # Generate diff
+            diff = generate_diff(old_content, new_content, filepath)
+            pending_diffs.append({"file": filepath, "diff": diff})
+            
+            if apply:
+                # Actually write the file
+                result = execute_tool(action, inputs)
+                if not result.get("success"):
+                    messages.append(f"Tool error: {result.get('error')}")
+                    continue
+            else:
+                # Simulate success without writing
+                result = {"success": True, "path": filepath, "preview_only": True}
+            
+            # Syntax check on new content
+            syntax_info = ""
+            if filepath.endswith(".py"):
+                syntax = TOOLS["check_syntax"]["function"](new_content)
+                last_syntax_valid = syntax.get("valid", True)
+                if not last_syntax_valid:
+                    syntax_info = f"\nSYNTAX CHECK: {json.dumps(syntax)}\n*** STILL INVALID - FIX AGAIN ***"
+                else:
+                    syntax_info = "\nSYNTAX CHECK: valid"
+            
+            messages.append(
+                f"{response}\n\nRESULT:\n{json.dumps(result)}\nDIFF:\n{diff}{syntax_info}"
+            )
+            continue
+
+        # 🔧 EXECUTE TOOL (non-write actions)
         result = execute_tool(action, inputs)
 
         if not result.get("success"):
@@ -346,11 +404,15 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
 
         if action == "read_file":
             filepath = inputs.get("path", "")
+            content = result.get("content", "")
+            
+            # Store original content for diff
+            file_contents[filepath] = content
+            
             # Track processed files for multi-file tasks
             if filepath not in processed_files:
                 processed_files.append(filepath)
             if filepath.endswith(".py"):
-                content = result.get("content", "")
                 syntax = TOOLS["check_syntax"]["function"](content)
 
                 last_syntax_valid = syntax.get("valid", True)
@@ -362,31 +424,17 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
                 else:
                     syntax_info += "\nSyntax OK"
 
-        # Re-check syntax after write_file by RE-READING the file
-        if action == "write_file":
-            filepath = inputs.get("path", "")
-            if filepath.endswith(".py"):
-                # Re-read file from disk to verify
-                read_result = TOOLS["read_file"]["function"](filepath)
-                if read_result.get("success"):
-                    content = read_result.get("content", "")
-                    syntax = TOOLS["check_syntax"]["function"](content)
-                    last_syntax_valid = syntax.get("valid", True)
-                    print(f"POST-WRITE SYNTAX: {syntax}")
-                    if not last_syntax_valid:
-                        syntax_info = f"\nSYNTAX AFTER WRITE: {json.dumps(syntax)}\n*** STILL INVALID - FIX AGAIN ***"
-                    else:
-                        syntax_info = "\nSYNTAX AFTER WRITE: valid"
-            else:
-                last_syntax_valid = True
-
         messages.append(
             f"{response}\n\nRESULT:\n{json.dumps(result)}{syntax_info}{file_selection_hint}"
         )
 
-    return {
+    result = {
         "success": False,
         "error": "Max iterations reached",
         "history": history
     }
+    if pending_diffs:
+        result["diffs"] = pending_diffs
+        result["applied"] = apply
+    return result
 

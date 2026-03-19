@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
 class AgentRequest(BaseModel):
     task: str
     max_iterations: int = 10
+    apply: bool = False
 
 
 class FileReadRequest(BaseModel):
@@ -56,7 +57,7 @@ def chat_endpoint(request: ChatRequest):
 def agent_endpoint(request: AgentRequest):
     """Run the agent on a task."""
     try:
-        result = run_agent(request.task, request.max_iterations, verbose=False)
+        result = run_agent(request.task, request.max_iterations, verbose=False, apply=request.apply)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
