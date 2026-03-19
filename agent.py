@@ -270,7 +270,7 @@ def execute_tool(action: str, inputs: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: bool = False) -> dict:
+def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve: bool = False) -> dict:
     # File selection context
     mentioned_file = extract_filename_from_task(task)
     multi_file = is_multi_file_task(task)
@@ -317,12 +317,12 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: b
                 continue
             result = {
                 "success": True,
+                "status": "applied" if pending_diffs else "complete",
                 "output": parsed.get("output", ""),
                 "history": history
             }
             if pending_diffs:
                 result["diffs"] = pending_diffs
-                result["applied"] = apply
             return result
 
         # 🔥 NO CHANGE (ENFORCED)
@@ -335,13 +335,14 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: b
 
             result = {
                 "success": True,
+                "status": "no_change",
                 "output": parsed.get("output", ""),
                 "history": history,
                 "modified": False
             }
             if pending_diffs:
                 result["diffs"] = pending_diffs
-                result["applied"] = apply
+                result["status"] = "applied"
             return result
 
         # 🔥 FORCE FIX MODE - block all actions except write_file when syntax invalid
@@ -367,27 +368,44 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, apply: b
             
             # Generate diff
             diff = generate_diff(old_content, new_content, filepath)
-            pending_diffs.append({"file": filepath, "diff": diff})
-            
-            if apply:
-                # Actually write the file
-                result = execute_tool(action, inputs)
-                if not result.get("success"):
-                    messages.append(f"Tool error: {result.get('error')}")
-                    continue
-            else:
-                # Simulate success without writing
-                result = {"success": True, "path": filepath, "preview_only": True}
             
             # Syntax check on new content
-            syntax_info = ""
+            syntax_valid = True
+            syntax_message = ""
             if filepath.endswith(".py"):
                 syntax = TOOLS["check_syntax"]["function"](new_content)
-                last_syntax_valid = syntax.get("valid", True)
-                if not last_syntax_valid:
-                    syntax_info = f"\nSYNTAX CHECK: {json.dumps(syntax)}\n*** STILL INVALID - FIX AGAIN ***"
-                else:
-                    syntax_info = "\nSYNTAX CHECK: valid"
+                syntax_valid = syntax.get("valid", True)
+                if not syntax_valid:
+                    syntax_message = syntax.get("message", "Syntax error")
+            
+            # 🔥 APPROVAL WORKFLOW
+            if not approve:
+                # Return pending approval - do NOT write
+                return {
+                    "success": True,
+                    "status": "pending_approval",
+                    "file": filepath,
+                    "diff": diff,
+                    "syntax_valid": syntax_valid,
+                    "syntax_message": syntax_message if not syntax_valid else None,
+                    "message": "Review the diff and approve to apply changes",
+                    "history": history
+                }
+            
+            # Approved - actually write the file
+            result = execute_tool(action, inputs)
+            if not result.get("success"):
+                messages.append(f"Tool error: {result.get('error')}")
+                continue
+            
+            pending_diffs.append({"file": filepath, "diff": diff})
+            last_syntax_valid = syntax_valid
+            
+            syntax_info = ""
+            if not syntax_valid:
+                syntax_info = f"\nSYNTAX CHECK: invalid - {syntax_message}\n*** STILL INVALID - FIX AGAIN ***"
+            else:
+                syntax_info = "\nSYNTAX CHECK: valid"
             
             messages.append(
                 f"{response}\n\nRESULT:\n{json.dumps(result)}\nDIFF:\n{diff}{syntax_info}"
