@@ -20,27 +20,101 @@ When using a tool:
   "input": {"param": "value"}
 }
 
-When finished:
+When finished with changes:
 {
   "thought": "summary of what was done",
   "action": "final_answer",
   "output": "your final answer to the user"
 }
 
+When NO changes needed:
+{
+  "thought": "why no changes are needed",
+  "action": "no_change",
+  "output": "explanation of why code is already acceptable"
+}
+
 CRITICAL RULES:
 
-1. READ BEFORE WRITE:
+1. FILE SELECTION LOGIC:
+   - If task contains a FULL PATH (e.g., "/home/user/test.py") → read_file directly
+   - If task contains only FILENAME (e.g., "test.py", "main.py"):
+     * First use list_files to find matching files
+     * Select the file whose name best matches the task keyword
+     * Then read_file on that specific file
+   - If task says "all files" or "the project" → list_files first, then process relevant ones
+   
+   FILE MATCHING PRIORITY:
+   - Exact filename match: task says "test.py" → choose "test.py"
+   - Partial match: task says "test" → prefer "test.py" over "main.py"
+   - Extension match: task says "Python files" → choose *.py files
+
+2. READ BEFORE WRITE:
    - If a task mentions a specific file → ALWAYS use read_file FIRST
    - NEVER assume a file does not exist
    - NEVER write without reading first
 
-2. MINIMAL IMPROVEMENT PRINCIPLE:
+3. AUTOMATIC SYNTAX CHECK:
+   When you read a Python file, the system AUTOMATICALLY runs syntax validation.
+   You will see "SYNTAX CHECK (automatic)" in the tool result.
+   
+   USE THIS RESULT TO DECIDE:
+   - If valid=false → YOU MUST FIX THE CODE (use write_file)
+   - If valid=true → decide improvement or no_change
+   
+   You do NOT need to call check_syntax yourself - it happens automatically.
+   But you MUST respect the result!
+
+4. DECIDE: MODIFY OR NO_CHANGE:
+   
+   *** DECISION PRIORITY (follow this order) ***
+   
+   STEP 1: CHECK FOR CRITICAL ERRORS FIRST
+   Ask: "Will this code run without crashing?"
+   
+   CRITICAL ERRORS (MUST FIX - no_change is FORBIDDEN):
+   - Syntax errors (missing colons, brackets, quotes, commas)
+   - Indentation errors (wrong indent level, mixed tabs/spaces)
+   - Invalid imports (typos, wrong module names)
+   - NameError risks (undefined variables)
+   - Code that would raise an exception when executed
+   
+   If ANY critical error exists → STOP → MUST use write_file to fix
+   NEVER return no_change if code has execution errors!
+   
+   STEP 2: ONLY IF CODE IS VALID, CHECK QUALITY
+   Quality issues (optional - may use no_change):
+   - Missing type hints
+   - Missing docstrings
+   - Minor formatting issues
+   - Style preferences
+   
+   NO_CHANGE is allowed ONLY when:
+   - Code runs correctly (no syntax/runtime errors)
+   - Code is properly indented
+   - No obvious bugs
+   
+   *** VERIFICATION BEFORE DECIDING ***
+   Before choosing no_change, mentally run the code:
+   1. Would "python filename.py" succeed? If NO → MUST FIX
+   2. Would "import filename" work? If NO → MUST FIX
+   3. Are all colons, brackets, quotes balanced? If NO → MUST FIX
+   
+   EXAMPLES:
+   - "def add(a,b) return a+b" → MUST FIX (syntax error: missing colon)
+   - "def add(a,b):\nreturn a+b" → MUST FIX (indentation error: return not indented)
+   - "import numpyy" → MUST FIX (invalid import)
+   - "x = [1, 2, 3" → MUST FIX (unclosed bracket)
+   - "def add(a,b):return a+b" → MAY FIX (valid but poor style)
+   - "def add(a: int, b: int) -> int:\n    '''Add.'''\n    return a + b" → NO_CHANGE OK
+
+4. MINIMAL IMPROVEMENT PRINCIPLE:
    - Prefer SMALL, LOCAL changes over large rewrites
    - Keep the original simplicity - do not expand simple code into complex systems
    - If input is 5 lines, output should be ~5-10 lines, NOT 50 lines
    - Do NOT introduce frameworks, patterns, or abstractions unless explicitly asked
 
-3. STRUCTURE PRESERVATION (ABSOLUTE - NEVER VIOLATE):
+5. STRUCTURE PRESERVATION (ABSOLUTE - NEVER VIOLATE):
    - Input structure MUST equal output structure:
      * function → function (same name, same params)
      * class → class (same name)
@@ -68,18 +142,26 @@ CRITICAL RULES:
    - Design patterns (factory, singleton, etc.)
    - Error handling beyond what exists (unless broken)
 
-5. WORKFLOW:
-   Step 1: read_file
-   Step 2: In thought: "This is [type] named [X] doing [Y]. Minimal improvements: types, docstring, formatting."
-   Step 3: write_file with improved version (same structure, same size)
-   Step 4: final_answer listing specific small changes
+6. WORKFLOW:
+   For SPECIFIC FILE (full path given):
+     Step 1: read_file directly
+     Step 2: improve
+     Step 3: write_file
+     Step 4: final_answer
+   
+   For FILENAME ONLY (e.g., "improve test.py"):
+     Step 1: list_files to find the file
+     Step 2: In thought: "Found [files]. Task mentions [X], selecting [path]."
+     Step 3: read_file on selected path
+     Step 4: improve and write_file
+     Step 5: final_answer
 
-6. SIZE CHECK:
+7. SIZE CHECK:
    - Input: 1 function → Output: 1 function
    - Input: ~10 lines → Output: ~10-15 lines (NOT 50+)
    - If you find yourself writing much more code, STOP - you are over-engineering
 
-7. CORRECT EXAMPLE:
+8. CORRECT EXAMPLE:
    Input:  def add(a,b): return a+b
    Output: def add(a: int, b: int) -> int:
                \"\"\"Add two numbers.\"\"\"
@@ -92,219 +174,146 @@ CRITICAL RULES:
 
 
 def parse_response(response: str) -> dict | None:
-    """Parse structured JSON response from LLM."""
-    # Try direct JSON parse
     try:
         return json.loads(response.strip())
-    except json.JSONDecodeError:
+    except:
         pass
-    
-    # Try to extract JSON from markdown code block
-    patterns = [
-        r'```json\s*\n?(.*?)\n?```',
-        r'```\s*\n?(.*?)\n?```',
-    ]
+
+    patterns = [r'```json\s*(.*?)```', r'```\s*(.*?)```']
     for pattern in patterns:
         match = re.search(pattern, response, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                # Try fixing common JSON issues
-                fixed = fix_json_string(match.group(1))
-                try:
-                    return json.loads(fixed)
-                except json.JSONDecodeError:
-                    continue
-    
-    # Try to find JSON object (greedy match for nested braces)
-    try:
-        start = response.find('{')
-        if start != -1:
-            depth = 0
-            for i, c in enumerate(response[start:], start):
-                if c == '{':
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                    if depth == 0:
-                        json_str = response[start:i+1]
-                        try:
-                            return json.loads(json_str)
-                        except json.JSONDecodeError:
-                            fixed = fix_json_string(json_str)
-                            return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-    
+            except:
+                continue
+
     return None
 
 
-def fix_json_string(s: str) -> str:
-    """Fix common JSON issues from LLM output."""
-    result = []
-    in_string = False
-    escape_next = False
-    i = 0
-    
-    while i < len(s):
-        char = s[i]
-        
-        if escape_next:
-            result.append(char)
-            escape_next = False
-            i += 1
-            continue
-        
-        if char == '\\':
-            result.append(char)
-            escape_next = True
-            i += 1
-            continue
-        
-        if char == '"' and not in_string:
-            in_string = True
-            result.append(char)
-            i += 1
-            continue
-        
-        if char == '"' and in_string:
-            # Check if this closes the string or is part of triple quotes
-            if i + 2 < len(s) and s[i:i+3] == '"""':
-                # Triple quote inside string - escape all three
-                result.append('\\"\\"\\"')
-                i += 3
-                continue
-            else:
-                # Check if next char suggests string continues (likely unescaped quote)
-                next_char = s[i+1] if i + 1 < len(s) else ''
-                if next_char not in [',', '}', ']', ':', '\n', ' ', '']:
-                    result.append('\\"')
-                    i += 1
-                    continue
-                in_string = False
-                result.append(char)
-                i += 1
-                continue
-        
-        if in_string:
-            if char == '\n':
-                result.append('\\n')
-            elif char == '\t':
-                result.append('\\t')
-            else:
-                result.append(char)
-        else:
-            result.append(char)
-        i += 1
-    
-    return ''.join(result)
-
-
 def execute_tool(action: str, inputs: dict) -> dict:
-    """Execute a tool and return the result."""
-    # Map action to tool with correct parameter names
     tool_map = {
-        "read_file": ("read_file", {"filepath": inputs.get("path", inputs.get("filepath"))}),
-        "write_file": ("write_file", {"filepath": inputs.get("path", inputs.get("filepath")), "content": inputs.get("content")}),
-        "list_files": ("list_files", {"directory": inputs.get("directory", "."), "pattern": inputs.get("pattern", "*")})
+        "read_file": ("read_file", {"filepath": inputs.get("path")}),
+        "write_file": ("write_file", {"filepath": inputs.get("path"), "content": inputs.get("content")}),
+        "list_files": ("list_files", {"directory": inputs.get("directory", "."), "pattern": inputs.get("pattern", "*")}),
     }
-    
+
     if action not in tool_map:
         return {"success": False, "error": f"Unknown tool: {action}"}
-    
-    tool_name, args = tool_map[action]
-    tool = TOOLS[tool_name]
-    
+
+    name, args = tool_map[action]
     try:
-        return tool["function"](**args)
+        return TOOLS[name]["function"](**args)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def run_agent(task: str, max_iterations: int = 5, verbose: bool = True) -> dict:
-    """Run the agent loop for a given task."""
     messages = [f"{SYSTEM_PROMPT}\n\nTask: {task}"]
     history = []
-    
+    last_syntax_valid = True  # Track syntax state across iterations
+
     for i in range(max_iterations):
-        if verbose:
-            print(f"\n--- Step {i + 1}/{max_iterations} ---")
-        
-        # Get LLM response
+
         context = "\n\n".join(messages)
         response = chat(context)
-        
-        if verbose:
-            print(f"Raw: {response[:300]}...")
-        
-        # Parse JSON response
+
         parsed = parse_response(response)
-        
         if not parsed:
-            # Retry once asking for valid JSON
-            messages.append(f"Assistant: {response}\n\nError: Invalid JSON. Please respond with valid JSON only.")
+            messages.append("Error: respond in valid JSON")
             continue
-        
+
+        action = parsed.get("action")
         thought = parsed.get("thought", "")
-        action = parsed.get("action", "")
-        
-        if verbose:
-            print(f"Thought: {thought}")
-            print(f"Action: {action}")
-        
-        history.append({"step": i + 1, "thought": thought, "action": action, "raw": response})
-        
-        # Check for final answer
+        inputs = parsed.get("input", {})
+
+        history.append({"step": i + 1, "action": action, "thought": thought})
+
+        # 🔥 FINAL ANSWER
         if action == "final_answer":
+            if last_syntax_valid is False:
+                messages.append(
+                    "Error: Code has syntax errors. You cannot finish. You MUST fix it using write_file."
+                )
+                continue
             return {
                 "success": True,
                 "output": parsed.get("output", ""),
-                "thought": thought,
-                "iterations": i + 1,
                 "history": history
             }
-        
-        # Validate action
-        if action not in ["read_file", "write_file", "list_files"]:
-            messages.append(f"Assistant: {response}\n\nError: Unknown action '{action}'. Use: read_file, write_file, list_files, or final_answer.")
+
+        # 🔥 NO CHANGE (ENFORCED)
+        if action == "no_change":
+            if last_syntax_valid is False:
+                messages.append(
+                    "Error: Code has syntax errors. 'no_change' is NOT allowed. You MUST fix it using write_file."
+                )
+                continue
+
+            return {
+                "success": True,
+                "output": parsed.get("output", ""),
+                "history": history,
+                "modified": False
+            }
+
+        # 🔥 FORCE FIX MODE - block all actions except write_file when syntax invalid
+        if last_syntax_valid is False and action != "write_file":
+            messages.append(
+                "Error: Syntax is invalid. You MUST use write_file to fix the code."
+            )
             continue
-        
-        # Execute tool
-        inputs = parsed.get("input", {})
-        if not inputs:
-            messages.append(f"Assistant: {response}\n\nError: Missing 'input' field. Provide input parameters.")
-            continue
-        
+
+        # 🔧 EXECUTE TOOL
         result = execute_tool(action, inputs)
-        
-        if verbose:
-            result_str = json.dumps(result)
-            print(f"Result: {result_str[:200]}{'...' if len(result_str) > 200 else ''}")
-        
-        history[-1]["result"] = result
-        
-        # If tool failed, include error in context
+
         if not result.get("success"):
-            messages.append(f"Assistant: {response}\n\nTool Error: {result.get('error', 'Unknown error')}. Try again.")
+            messages.append(f"Tool error: {result.get('error')}")
             continue
-        
-        # Add to context for next iteration
-        messages.append(f"Assistant: {response}\n\nTool Result:\n{json.dumps(result)}\n\nContinue with your next step.")
-    
+
+        # 🔥 AUTO SYNTAX CHECK
+        syntax_info = ""
+
+        if action == "read_file":
+            filepath = inputs.get("path", "")
+            if filepath.endswith(".py"):
+                content = result.get("content", "")
+                syntax = TOOLS["check_syntax"]["function"](content)
+
+                last_syntax_valid = syntax.get("valid", True)
+
+                syntax_info = f"\nSYNTAX: {json.dumps(syntax)}"
+
+                if not last_syntax_valid:
+                    syntax_info += "\n*** SYNTAX INVALID - YOU MUST FIX WITH write_file ***"
+                else:
+                    syntax_info += "\nSyntax OK"
+
+        # Re-check syntax after write_file by RE-READING the file
+        if action == "write_file":
+            filepath = inputs.get("path", "")
+            if filepath.endswith(".py"):
+                # Re-read file from disk to verify
+                read_result = TOOLS["read_file"]["function"](filepath)
+                if read_result.get("success"):
+                    content = read_result.get("content", "")
+                    syntax = TOOLS["check_syntax"]["function"](content)
+                    last_syntax_valid = syntax.get("valid", True)
+                    print(f"POST-WRITE SYNTAX: {syntax}")
+                    if not last_syntax_valid:
+                        syntax_info = f"\nSYNTAX AFTER WRITE: {json.dumps(syntax)}\n*** STILL INVALID - FIX AGAIN ***"
+                    else:
+                        syntax_info = "\nSYNTAX AFTER WRITE: valid"
+            else:
+                last_syntax_valid = True
+
+        messages.append(
+            f"{response}\n\nRESULT:\n{json.dumps(result)}{syntax_info}"
+        )
+
     return {
         "success": False,
         "error": "Max iterations reached",
-        "iterations": max_iterations,
         "history": history
     }
 
-
-if __name__ == "__main__":
-    print("Testing structured agent...")
-    result = run_agent("List all Python files in the current directory and summarize what each one does based on filename.")
-    print(f"\n{'='*50}")
-    print(f"Success: {result['success']}")
-    print(f"Iterations: {result['iterations']}")
-    if result['success']:
-        print(f"Output: {result['output']}")
