@@ -23,6 +23,7 @@ class AgentRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     task_id: str
+    files: list[str] | None = None  # Optional: partial approval - only apply these files
 
 
 class FileReadRequest(BaseModel):
@@ -61,22 +62,35 @@ def chat_endpoint(request: ChatRequest):
 
 @app.post("/agent")
 def agent_endpoint(request: AgentRequest):
-    """Run the agent on a task. Returns diff for approval."""
+    """Run the agent on a task. Returns diff for approval (supports multi-file batch)."""
     import uuid
     try:
         result = run_agent(request.task, request.max_iterations, verbose=False, approve=False)
         
-        # If pending approval, store the change
+        # If pending approval, store the change(s)
         if result.get("status") == "pending_approval":
             task_id = str(uuid.uuid4())[:8]
+            
+            # Agent now always returns "files" array
+            files_data = result.get("files", [])
+            
+            # Store internally
             pending_changes[task_id] = {
-                "file": result.get("file"),
-                "content": result.get("new_content"),
-                "diff": result.get("diff"),
+                "files": files_data,
                 "task": request.task
             }
-            result["task_id"] = task_id
-            result["approve_url"] = f"POST /approve with task_id: {task_id}"
+            
+            # Return structured multi-file response
+            return {
+                "status": "pending_approval",
+                "task_id": task_id,
+                "files": [
+                    {"file": f["file"], "diff": f.get("diff", "")}
+                    for f in files_data
+                ],
+                "file_count": len(files_data),
+                "message": f"Review {len(files_data)} file(s) and POST /approve with task_id: {task_id}"
+            }
         
         return result
     except Exception as e:
@@ -85,26 +99,55 @@ def agent_endpoint(request: AgentRequest):
 
 @app.post("/approve")
 def approve_endpoint(request: ApproveRequest):
-    """Approve and apply pending changes."""
+    """Approve and apply pending changes (supports multi-file batch and partial approval)."""
     task_id = request.task_id
     
     if task_id not in pending_changes:
         raise HTTPException(status_code=404, detail=f"No pending changes for task_id: {task_id}")
     
-    change = pending_changes.pop(task_id)
+    change = pending_changes[task_id]
+    all_files = change.get("files", [])
     
-    # Apply the change
-    result = write_file(change["file"], change["content"])
+    # Partial approval: filter to requested files only
+    if request.files:
+        files_to_apply = [f for f in all_files if f.get("file") in request.files]
+        remaining_files = [f for f in all_files if f.get("file") not in request.files]
+    else:
+        files_to_apply = all_files
+        remaining_files = []
     
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error"))
+    applied = []
+    errors = []
+    
+    # Apply selected files
+    for f in files_to_apply:
+        filepath = f.get("file")
+        content = f.get("content")
+        
+        result = write_file(filepath, content)
+        
+        if result.get("success"):
+            applied.append(filepath)
+        else:
+            errors.append({
+                "file": filepath,
+                "error": result.get("error")
+            })
+    
+    # Update or remove pending changes
+    if remaining_files:
+        pending_changes[task_id]["files"] = remaining_files
+    else:
+        pending_changes.pop(task_id)
     
     return {
-        "success": True,
-        "status": "applied",
-        "file": change["file"],
-        "diff": change["diff"],
-        "message": f"Changes applied to {change['file']}"
+        "status": "applied" if not errors else "partial",
+        "task_id": task_id,
+        "files": applied,
+        "file_count": len(applied),
+        "errors": errors if errors else None,
+        "remaining": len(remaining_files) if remaining_files else None,
+        "message": f"Applied changes to {len(applied)} file(s)"
     }
 
 
@@ -113,7 +156,12 @@ def pending_endpoint():
     """List all pending changes awaiting approval."""
     return {
         "pending": [
-            {"task_id": tid, "file": data["file"], "task": data["task"]}
+            {
+                "task_id": tid,
+                "files": [f["file"] for f in data.get("files", [])],
+                "file_count": len(data.get("files", [])),
+                "task": data["task"]
+            }
             for tid, data in pending_changes.items()
         ]
     }
@@ -126,11 +174,12 @@ def reject_endpoint(task_id: str):
         raise HTTPException(status_code=404, detail=f"No pending changes for task_id: {task_id}")
     
     change = pending_changes.pop(task_id)
+    files = [f["file"] for f in change.get("files", [])]
     return {
         "success": True,
         "status": "rejected",
-        "file": change["file"],
-        "message": "Changes discarded"
+        "files": files,
+        "message": f"Discarded changes to {len(files)} file(s)"
     }
 
 

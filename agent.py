@@ -27,13 +27,10 @@ def generate_diff(old_content: str, new_content: str, filepath: str) -> str:
     return "".join(diff)
 
 
-def extract_filename_from_task(task: str) -> str | None:
-    """Extract filename mentioned in task."""
-    # Match patterns like "test.py", "main.py", "/path/to/file.py"
-    match = re.search(r'[\w/\\.-]+\.py\b', task, re.IGNORECASE)
-    if match:
-        return match.group(0)
-    return None
+def extract_filenames_from_task(task: str) -> list[str]:
+    """Extract all filenames mentioned in task."""
+    matches = re.findall(r'[\w/\\.-]+\.py\b', task, re.IGNORECASE)
+    return list(set(matches))  # Deduplicate
 
 
 def is_multi_file_task(task: str) -> bool:
@@ -272,21 +269,25 @@ def execute_tool(action: str, inputs: dict) -> dict:
 
 def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve: bool = False) -> dict:
     # File selection context
-    mentioned_file = extract_filename_from_task(task)
-    multi_file = is_multi_file_task(task)
+    mentioned_files = extract_filenames_from_task(task)
+    mentioned_file = mentioned_files[0] if mentioned_files else None
+    multi_file = is_multi_file_task(task) or len(mentioned_files) > 1
     files_to_process = []
     processed_files = []
     
     # Track original file contents for diff
     file_contents = {}  # {filepath: original_content}
     pending_diffs = []  # Store diffs to show
+    pending_writes = []  # Store pending writes for multi-file: [{file, content, diff}, ...]
     
     # Build initial context with file hints
     file_hint = ""
-    if mentioned_file:
+    if len(mentioned_files) > 1:
+        file_hint = f"\n\nHINT: Multiple files mentioned {mentioned_files} - process each one."
+    elif mentioned_file:
         file_hint = f"\n\nHINT: Task mentions file '{mentioned_file}' - prioritize this file."
     elif multi_file:
-        file_hint = "\n\nHINT: This is a multi-file task. Use list_files first, then process each relevant file."
+        file_hint = "\n\nHINT: This is a multi-file task. Use list_files first, then process each relevant file one by one."
     
     messages = [f"{SYSTEM_PROMPT}\n\nTask: {task}{file_hint}"]
     history = []
@@ -315,6 +316,19 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve:
                     "Error: Code has syntax errors. You cannot finish. You MUST fix it using write_file."
                 )
                 continue
+            
+            # Return pending writes for approval (multi-file batch)
+            if pending_writes:
+                return {
+                    "success": True,
+                    "status": "pending_approval",
+                    "files": pending_writes,
+                    "file_count": len(pending_writes),
+                    "output": parsed.get("output", ""),
+                    "message": f"Review {len(pending_writes)} file(s) and approve to apply changes",
+                    "history": history
+                }
+            
             result = {
                 "success": True,
                 "status": "applied" if pending_diffs else "complete",
@@ -332,6 +346,18 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve:
                     "Error: Code has syntax errors. 'no_change' is NOT allowed. You MUST fix it using write_file."
                 )
                 continue
+
+            # Return any pending writes even with no_change
+            if pending_writes:
+                return {
+                    "success": True,
+                    "status": "pending_approval",
+                    "files": pending_writes,
+                    "file_count": len(pending_writes),
+                    "output": parsed.get("output", ""),
+                    "message": f"Review {len(pending_writes)} file(s) and approve to apply changes",
+                    "history": history
+                }
 
             result = {
                 "success": True,
@@ -380,18 +406,31 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve:
             
             # 🔥 APPROVAL WORKFLOW
             if not approve:
-                # Return pending approval - do NOT write
-                return {
-                    "success": True,
-                    "status": "pending_approval",
+                # Store pending write for batch approval
+                pending_writes.append({
                     "file": filepath,
-                    "new_content": new_content,  # Store for later apply
+                    "content": new_content,
                     "diff": diff,
                     "syntax_valid": syntax_valid,
-                    "syntax_message": syntax_message if not syntax_valid else None,
-                    "message": "Review the diff and approve to apply changes",
-                    "history": history
-                }
+                    "syntax_message": syntax_message if not syntax_valid else None
+                })
+                
+                # For single-file tasks, return immediately
+                if not multi_file:
+                    return {
+                        "success": True,
+                        "status": "pending_approval",
+                        "files": pending_writes,
+                        "file_count": len(pending_writes),
+                        "message": "Review the diff and approve to apply changes",
+                        "history": history
+                    }
+                
+                # For multi-file: continue processing, tell LLM write was queued
+                messages.append(
+                    f"{response}\n\nRESULT: Change queued for {filepath}\nDIFF:\n{diff}\n\nContinue with next file or use final_answer when done."
+                )
+                continue
             
             # Approved - actually write the file
             result = execute_tool(action, inputs)
@@ -477,4 +516,3 @@ def run_agent(task: str, max_iterations: int = 5, verbose: bool = True, approve:
         result["diffs"] = pending_diffs
         result["applied"] = apply
     return result
-
